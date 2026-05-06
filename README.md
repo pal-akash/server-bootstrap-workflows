@@ -2,7 +2,7 @@
 
 A GitHub Actions workflow that turns a fresh Ubuntu VPS into a Docker-ready server — without you having to SSH in and run commands manually.
 
-Works with DigitalOcean, AWS EC2, Hetzner, Linode, Vultr, Oracle Cloud, or any VPS running Ubuntu 20.04+.
+Works with VPS running Ubuntu 20.04+.
 
 ---
 
@@ -93,14 +93,13 @@ From here you can start deploying your containers. If you're using Docker Compos
 - Ubuntu 22.04 LTS
 - Ubuntu 24.04 LTS
 - DigitalOcean Droplets
-
-Should work on any Ubuntu 20.04+ VPS. If you run into an issue on a specific provider or OS version, open an issue.
-
+  
 ---
 
 ## Contributing
 
-If something doesn't work for your setup, PRs are welcome. Keep it focused — this is meant to stay simple and readable, not become a full-blown provisioning tool.
+I built it for my own use and put it up in case it helps someone.
+If something's broken, feel free to fork it and adapt it to your setup.
 
 ---
 
