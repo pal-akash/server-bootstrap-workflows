@@ -1,0 +1,292 @@
+name: 🛠️ Server Bootstrap
+
+# Run this ONCE on any fresh Ubuntu server to install Docker,
+# configure firewall, harden SSH, and prepare the system for deployments.
+# Works with DigitalOcean, AWS EC2, Hetzner, Linode, Vultr, etc.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ssh_host:
+        description: "Server IP or hostname"
+        required: true
+        type: string
+      ssh_user:
+        description: "SSH username (e.g. root or ubuntu)"
+        required: true
+        default: "root"
+        type: string
+      ssh_port:
+        description: "SSH port"
+        required: false
+        default: "22"
+        type: string
+      deploy_user:
+        description: "Non-root user to create for deployments (leave empty to skip)"
+        required: false
+        default: "deploy"
+        type: string
+      open_ports:
+        description: "Comma-separated ports to open in UFW (e.g. 80,443,3000)"
+        required: false
+        default: "22,80,443"
+        type: string
+      install_extras:
+        description: "Install extra tools: nginx, certbot, make, htop, etc."
+        required: false
+        default: true
+        type: boolean
+      setup_swap:
+        description: "Create a 2GB swap file (useful for small servers)"
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  bootstrap:
+    name: Bootstrap Ubuntu Server
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo (for any local scripts)
+        uses: actions/checkout@v4
+
+      # ─── SSH Key ──────────────────────────────────────────────────────────────
+      # The private key must be stored as a GitHub secret: SSH_PRIVATE_KEY
+      # The public key must be in ~/.ssh/authorized_keys on the server.
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -p ${{ inputs.ssh_port }} -H ${{ inputs.ssh_host }} >> ~/.ssh/known_hosts
+
+      # ─── 1. System Update ─────────────────────────────────────────────────────
+      - name: Update & upgrade system packages
+        run: |
+          ssh -p ${{ inputs.ssh_port }} ${{ inputs.ssh_user }}@${{ inputs.ssh_host }} << 'EOF'
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -y
+            apt-get upgrade -y
+            apt-get autoremove -y
+            apt-get autoclean -y
+          EOF
+
+      # ─── 2. Install Core Dependencies ────────────────────────────────────────
+      - name: Install core dependencies
+        run: |
+          ssh -p ${{ inputs.ssh_port }} ${{ inputs.ssh_user }}@${{ inputs.ssh_host }} << 'EOF'
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get install -y \
+              curl \
+              wget \
+              git \
+              unzip \
+              gnupg \
+              lsb-release \
+              ca-certificates \
+              apt-transport-https \
+              software-properties-common \
+              ufw \
+              fail2ban \
+              jq
+          EOF
+
+      # ─── 3. Install Docker ────────────────────────────────────────────────────
+      - name: Install Docker Engine
+        run: |
+          ssh -p ${{ inputs.ssh_port }} ${{ inputs.ssh_user }}@${{ inputs.ssh_host }} << 'EOF'
+            # Remove any old Docker installations
+            for pkg in docker.io docker-doc docker-compose podman-docker containerd runc; do
+              apt-get remove -y $pkg 2>/dev/null || true
+            done
+
+            # Add Docker's official GPG key
+            install -m 0755 -d /etc/apt/keyrings
+            curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+              -o /etc/apt/keyrings/docker.asc
+            chmod a+r /etc/apt/keyrings/docker.asc
+
+            # Add Docker repository
+            echo \
+              "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \
+              https://download.docker.com/linux/ubuntu \
+              $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+              | tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+            apt-get update -y
+            apt-get install -y \
+              docker-ce \
+              docker-ce-cli \
+              containerd.io \
+              docker-buildx-plugin \
+              docker-compose-plugin
+
+            # Enable & start Docker
+            systemctl enable docker
+            systemctl start docker
+
+            # Verify
+            docker --version
+            docker compose version
+          EOF
+
+      # ─── 4. Create Deploy User ────────────────────────────────────
+      - name: Create deploy user and add to docker group
+        if: ${{ inputs.deploy_user != '' }}
+        run: |
+          DEPLOY_USER="${{ inputs.deploy_user }}"
+          ssh -p ${{ inputs.ssh_port }} ${{ inputs.ssh_user }}@${{ inputs.ssh_host }} << EOF
+            # Create user if it doesn't exist
+            if ! id "$DEPLOY_USER" &>/dev/null; then
+              useradd -m -s /bin/bash "$DEPLOY_USER"
+              echo "✅ User '$DEPLOY_USER' created"
+            else
+              echo "ℹ️  User '$DEPLOY_USER' already exists"
+            fi
+
+            # Add to docker group so they can run docker without sudo
+            usermod -aG docker "$DEPLOY_USER"
+            usermod -aG sudo "$DEPLOY_USER"
+
+            # Copy SSH authorized_keys from current user
+            mkdir -p /home/$DEPLOY_USER/.ssh
+            cp ~/.ssh/authorized_keys /home/$DEPLOY_USER/.ssh/authorized_keys 2>/dev/null || true
+            chown -R $DEPLOY_USER:$DEPLOY_USER /home/$DEPLOY_USER/.ssh
+            chmod 700 /home/$DEPLOY_USER/.ssh
+            chmod 600 /home/$DEPLOY_USER/.ssh/authorized_keys
+
+            echo "✅ '$DEPLOY_USER' added to docker group and SSH access configured"
+          EOF
+
+      # ─── 5. Configure UFW Firewall ────────────────────────────────────────────
+      - name: Configure UFW firewall
+        run: |
+          PORTS="${{ inputs.open_ports }}"
+          ssh -p ${{ inputs.ssh_port }} ${{ inputs.ssh_user }}@${{ inputs.ssh_host }} << EOF
+            # Reset and set defaults
+            ufw --force reset
+            ufw default deny incoming
+            ufw default allow outgoing
+
+            # Open specified ports
+            IFS=',' read -ra PORT_LIST <<< "$PORTS"
+            for port in "\${PORT_LIST[@]}"; do
+              port=\$(echo "\$port" | xargs)  # trim whitespace
+              ufw allow "\$port"
+              echo "✅ Opened port \$port"
+            done
+
+            # Enable UFW
+            ufw --force enable
+            ufw status verbose
+          EOF
+
+      # ─── 6. Configure Fail2Ban ────────────────────────────────────────────────
+      - name: Configure Fail2Ban (SSH brute-force protection)
+        run: |
+          ssh -p ${{ inputs.ssh_port }} ${{ inputs.ssh_user }}@${{ inputs.ssh_host }} << 'EOF'
+            cat > /etc/fail2ban/jail.local << 'JAIL'
+          [DEFAULT]
+          bantime  = 3600
+          findtime = 600
+          maxretry = 5
+
+          [sshd]
+          enabled = true
+          port    = ssh
+          logpath = %(sshd_log)s
+          backend = %(syslog_backend)s
+          JAIL
+
+            systemctl enable fail2ban
+            systemctl restart fail2ban
+            echo "✅ Fail2Ban configured and running"
+          EOF
+
+      # ─── 7. Swap File ─────────────────────────────────────────────────────────
+      - name: Create 2GB swap file
+        if: ${{ inputs.setup_swap == 'true' }}
+        run: |
+          ssh -p ${{ inputs.ssh_port }} ${{ inputs.ssh_user }}@${{ inputs.ssh_host }} << 'EOF'
+            if [ ! -f /swapfile ]; then
+              fallocate -l 2G /swapfile
+              chmod 600 /swapfile
+              mkswap /swapfile
+              swapon /swapfile
+              echo '/swapfile none swap sw 0 0' >> /etc/fstab
+              # Tune swappiness
+              sysctl vm.swappiness=10
+              echo 'vm.swappiness=10' >> /etc/sysctl.conf
+              echo "✅ 2GB swap created"
+            else
+              echo "ℹ️  Swap already exists, skipping"
+            fi
+            free -h
+          EOF
+
+      # ─── 8. Extra Tools ───────────────────────────────────────────────────────
+      - name: Install extra utilities
+        if: ${{ inputs.install_extras == 'true' }}
+        run: |
+          ssh -p ${{ inputs.ssh_port }} ${{ inputs.ssh_user }}@${{ inputs.ssh_host }} << 'EOF'
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get install -y \
+              htop \
+              ncdu \
+              tree \
+              make \
+              net-tools \
+              dnsutils \
+              nano \
+              vim
+            echo "✅ Extra tools installed"
+          EOF
+
+      # ─── 9. Create App Directory Structure ───────────────────────────────────
+      - name: Create standard app directory structure
+        run: |
+          ssh -p ${{ inputs.ssh_port }} ${{ inputs.ssh_user }}@${{ inputs.ssh_host }} << 'EOF'
+            mkdir -p /srv/app/{frontend,backend,nginx,data,logs,backups}
+            echo "✅ App directories created at /srv/app/"
+            ls -la /srv/app/
+          EOF
+
+      # ─── 10. Harden SSH Config ────────────────────────────────────────────────
+      - name: Harden SSH configuration
+        run: |
+          ssh -p ${{ inputs.ssh_port }} ${{ inputs.ssh_user }}@${{ inputs.ssh_host }} << 'EOF'
+            # Backup original config
+            cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak
+
+            # Apply hardened settings (non-destructively)
+            grep -qxF 'PermitRootLogin prohibit-password' /etc/ssh/sshd_config \
+              || sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
+
+            grep -qxF 'PasswordAuthentication no' /etc/ssh/sshd_config \
+              || sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
+
+            grep -qxF 'X11Forwarding no' /etc/ssh/sshd_config \
+              || sed -i 's/^#\?X11Forwarding.*/X11Forwarding no/' /etc/ssh/sshd_config
+
+            systemctl reload sshd
+            echo "✅ SSH hardened (key-only auth, no root password login)"
+          EOF
+
+      # ─── Summary ──────────────────────────────────────────────────────────────
+      - name: Print server summary
+        run: |
+          ssh -p ${{ inputs.ssh_port }} ${{ inputs.ssh_user }}@${{ inputs.ssh_host }} << 'EOF'
+            echo ""
+            echo "════════════════════════════════════════"
+            echo "      🚀 SERVER BOOTSTRAP COMPLETE"
+            echo "════════════════════════════════════════"
+            echo "OS:           $(lsb_release -ds)"
+            echo "Docker:       $(docker --version)"
+            echo "Compose:      $(docker compose version)"
+            echo "Swap:         $(free -h | awk '/Swap/ {print $2}')"
+            echo "UFW Status:   $(ufw status | head -1)"
+            echo "Fail2Ban:     $(systemctl is-active fail2ban)"
+            echo "App dir:      /srv/app/"
+            echo "════════════════════════════════════════"
+          EOF
