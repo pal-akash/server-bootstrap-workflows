@@ -98,8 +98,7 @@ From here you can start deploying your containers. If you're using Docker Compos
 
 ## Contributing
 
-I built it for my own use and put it up in case it helps someone.
-If something's broken, feel free to fork it and adapt it to your setup.
+I built it for my own use and put it up in case it helps someone. If something doesn't work for your setup feel free to fork it and adapt it to your setup. If you want to add support for something new, feel free to open a PR.
 
 ---
 
